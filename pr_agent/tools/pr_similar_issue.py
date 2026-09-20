@@ -261,6 +261,16 @@ class PRSimilarIssue:
                     issue_main.create_comment("Please set qdrant url and api key in secrets file")
                 raise Exception("Please set qdrant url and api key in secrets file")
 
+            # Empty strings from .secrets_template.toml must not reach QdrantClient:
+            # url="" + api_key="" is treated as https://localhost:6333.
+            # An empty api_key is still valid for unauthenticated self-hosted Qdrant.
+            if not (url or "").strip():
+                if not self.cli_mode:
+                    repo_name, original_issue_number = self.git_provider._parse_issue_url(self.issue_url.split('=')[-1])
+                    issue_main = self.git_provider.repo_obj.get_issue(original_issue_number)
+                    issue_main.create_comment("Please set qdrant url and api key in secrets file")
+                raise Exception("Please set qdrant url and api key in secrets file")
+
             self.qdrant = qdrant_client.QdrantClient(url=url, api_key=api_key)
 
             run_from_scratch = False
