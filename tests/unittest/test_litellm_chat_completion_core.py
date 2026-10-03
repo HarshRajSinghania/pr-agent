@@ -45,7 +45,7 @@ class FakeSettings:
             custom_reasoning_model=False,
             max_model_tokens=32000,
             verbosity_level=0,
-            model="gpt-4o",
+            model=(config_values or {}).get("model", "gpt-4o"),
         )
         self.litellm = FakeBox()
         self._settings_values = {
@@ -161,17 +161,31 @@ async def test_chat_completion_dead_image_uses_current_help_link(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("model", "expected_model_id"),
+    ("model", "configured_model", "expected_model_id"),
     [
-        ("bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0", "profile-123"),
-        ("bedrock_mantle/xai.grok-4.3", None),
+        (
+            "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "profile-123",
+        ),
+        (
+            "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+            "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
+            None,
+        ),
+        ("bedrock_mantle/xai.grok-4.3", "bedrock_mantle/xai.grok-4.3", None),
     ],
 )
-async def test_chat_completion_scopes_model_id_to_classic_bedrock(monkeypatch, model, expected_model_id):
+async def test_chat_completion_scopes_model_id_to_classic_bedrock(
+    monkeypatch, model, configured_model, expected_model_id
+):
     monkeypatch.setattr(
         litellm_handler,
         "get_settings",
-        lambda: FakeSettings(settings_values={"litellm.model_id": "profile-123"}),
+        lambda: FakeSettings(
+            config_values={"model": configured_model},
+            settings_values={"litellm.model_id": "profile-123"},
+        ),
     )
 
     with patch("pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion", new_callable=AsyncMock) as mock_call:
@@ -188,16 +202,20 @@ async def test_chat_completion_scopes_model_id_to_classic_bedrock(monkeypatch, m
 
 @pytest.mark.asyncio
 async def test_health_probe_uses_snapshotted_classic_bedrock_model_id(monkeypatch):
-    active_settings = FakeSettings(settings_values={"litellm.model_id": "profile-a"})
+    primary = "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0"
+    active_settings = FakeSettings(
+        config_values={"model": primary},
+        settings_values={"litellm.model_id": "profile-a"},
+    )
     monkeypatch.setattr(litellm_handler, "get_settings", lambda: active_settings)
     handler = litellm_handler.LiteLLMAIHandler()
-    active_settings = FakeSettings(settings_values={"litellm.model_id": "profile-b"})
+    active_settings = FakeSettings(
+        config_values={"model": primary},
+        settings_values={"litellm.model_id": "profile-b"},
+    )
     completion = AsyncMock(return_value=_mock_response())
 
-    await handler.probe_completion(
-        "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
-        _completion=completion,
-    )
+    await handler.probe_completion(primary, _completion=completion)
 
     assert completion.call_args.kwargs["model_id"] == "profile-a"
 

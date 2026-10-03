@@ -470,6 +470,8 @@ class LiteLLMAIHandler(BaseAiHandler):
             )
         }
         self._bedrock_model_id = settings.get("litellm.model_id", None)
+        self._bedrock_model_ids = settings.get("litellm.model_ids", None)
+        self._configured_model = getattr(settings.config, "model", None)
         self._custom_llm_provider = str(
             getattr(settings.litellm, "custom_llm_provider", "") or ""
         ).strip().lower()
@@ -606,6 +608,31 @@ class LiteLLMAIHandler(BaseAiHandler):
                     "Ignoring invalid value."
                 )
             self.force_streaming_api_base_substrings = []
+
+    def _bedrock_inference_profile_id(self, model: str):
+        """Profile ARN for this classic Bedrock request, if one is configured for it.
+
+        ``litellm.model_id`` belongs to ``config.model``. LiteLLM uses ``model_id`` in
+        place of the model name when it builds the Bedrock Runtime URL, so applying
+        the primary profile to a fallback model sends that fallback to the primary
+        profile. ``litellm.model_ids`` maps a model name to its own profile ARN.
+        """
+        model_ids = getattr(self, "_bedrock_model_ids", None)
+        if isinstance(model_ids, dict):
+            mapped = model_ids.get(model)
+            if isinstance(mapped, str) and mapped.strip():
+                return mapped.strip()
+        profile = getattr(self, "_bedrock_model_id", None)
+        configured = getattr(self, "_configured_model", None)
+        if (
+            isinstance(profile, str)
+            and profile.strip()
+            and isinstance(model, str)
+            and isinstance(configured, str)
+            and model == configured
+        ):
+            return profile.strip()
+        return None
 
     @staticmethod
     def _litellm_otel_callback_enabled() -> bool:
@@ -2909,7 +2936,8 @@ class LiteLLMAIHandler(BaseAiHandler):
 
                 # Classic `bedrock/` calls use model_id for Bedrock Runtime inference profiles.
                 # Bedrock Mantle uses Projects, so `bedrock_mantle/` intentionally omits it.
-                bedrock_model_id = getattr(self, "_bedrock_model_id", None)
+                # Scalar model_id applies only to config.model. model_ids can profile a fallback.
+                bedrock_model_id = self._bedrock_inference_profile_id(model)
                 if bedrock_model_id and request_provider == "bedrock":
                     kwargs["model_id"] = bedrock_model_id
                     get_logger().info(f"Using Bedrock custom inference profile: {bedrock_model_id}")
@@ -3016,8 +3044,9 @@ class LiteLLMAIHandler(BaseAiHandler):
             ))
             if custom_llm_provider:
                 kwargs["custom_llm_provider"] = custom_llm_provider
-            if self._bedrock_model_id and request_provider == "bedrock":
-                kwargs["model_id"] = self._bedrock_model_id
+            bedrock_model_id = self._bedrock_inference_profile_id(model)
+            if bedrock_model_id and request_provider == "bedrock":
+                kwargs["model_id"] = bedrock_model_id
             streaming = self._requires_streaming(kwargs["model"]) or self._force_streaming_for_request(
                 custom_llm_provider, kwargs.get("api_base")
             )
