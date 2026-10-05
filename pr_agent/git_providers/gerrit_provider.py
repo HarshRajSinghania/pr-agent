@@ -403,10 +403,15 @@ class GerritProvider(GitProvider):
             if not isinstance(suggestion, dict) or not isinstance(suggestion.get("relevant_file"), str):
                 get_logger().warning("Skipping malformed suggestion: missing or invalid 'relevant_file'")
                 continue
-            # Sanitize file path to prevent directory traversal
+            # Sanitize file path to prevent directory traversal.
+            # resolve() follows symlinks, so a tracked symlink into .git/
+            # would pass relative_to() and then be written by add_suggestion.
             try:
-                target_path = (repo_root / suggestion["relevant_file"]).resolve()
+                unresolved = repo_root / suggestion["relevant_file"]
+                target_path = unresolved.resolve()
                 target_path.relative_to(repo_root)
+                if unresolved.is_symlink() or ".git" in target_path.parts:
+                    raise ValueError("refuses to write through a symlink or into git metadata")
             except ValueError:
                 get_logger().warning(f"Skipping suggestion with path traversal: {suggestion['relevant_file']}")
                 continue
