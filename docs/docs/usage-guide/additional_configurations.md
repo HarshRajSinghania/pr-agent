@@ -505,6 +505,8 @@ PR-Agent allows you to automatically ignore certain PRs based on various criteri
 - PRs containing specific labels
 - PRs opened by specific users
 
+These keys apply to webhook servers and to the CLI (`--pr_url`). Plain-diff mode (`--stdin` / `--diff-file`) has no pull request to evaluate, so the keys are not applied there. On the CLI, `ignore_pr_authors` matches the pull request author, because there is no webhook event sender.
+
 ### Ignoring PRs with specific titles
 
 To ignore PRs with a specific title such as "[Bump]: ...", you can add the following to your `configuration.toml` file:

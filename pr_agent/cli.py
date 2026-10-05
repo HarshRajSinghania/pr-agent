@@ -170,6 +170,87 @@ def run_command(pr_url, command):
     return run(args=args)
 
 
+def _pr_author(provider) -> str:
+    """PR author login for CLI ignore rules. There is no webhook sender on this path."""
+    pr = getattr(provider, "pr", None)
+    if pr is None:
+        return ""
+    user = getattr(pr, "user", None)
+    for attr in ("login", "username", "name"):
+        value = getattr(user, attr, None)
+        if value:
+            return str(value)
+    author = getattr(pr, "author", None)
+    if isinstance(author, str):
+        return author
+    if author is None:
+        return ""
+    for attr in ("login", "username", "name"):
+        value = getattr(author, attr, None)
+        if value:
+            return str(value)
+    nested = getattr(author, "user", None)
+    for attr in ("login", "username", "name"):
+        value = getattr(nested, attr, None)
+        if value:
+            return str(value)
+    return ""
+
+
+def _target_branch(provider) -> str:
+    pr = getattr(provider, "pr", None)
+    if pr is None:
+        return ""
+    base = getattr(pr, "base", None)
+    ref = getattr(base, "ref", None)
+    if ref:
+        return str(ref)
+    for attr in ("target_branch", "base_ref"):
+        value = getattr(pr, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    destination = getattr(pr, "destination", None)
+    branch = getattr(destination, "branch", None)
+    name = getattr(branch, "name", None)
+    if name:
+        return str(name)
+    return ""
+
+
+def _cli_should_process_pr(pr_url: str) -> bool:
+    """Apply config.ignore_pr_* on the CLI, after repo settings, matching the webhook servers.
+
+    Fail open if the provider or PR metadata cannot be read: a broken exclusion check must
+    not block a review the operator explicitly requested.
+    """
+    from pr_agent.git_providers import get_git_provider_with_context
+    from pr_agent.git_providers.utils import apply_repo_settings
+    from pr_agent.servers.utils import should_process_pr_logic
+
+    try:
+        apply_repo_settings(pr_url)
+        provider = get_git_provider_with_context(pr_url)
+        title = provider.get_title() if hasattr(provider, "get_title") else ""
+        source_branch = provider.get_pr_branch() if hasattr(provider, "get_pr_branch") else ""
+        labels = provider.get_pr_labels() if hasattr(provider, "get_pr_labels") else []
+        if not labels:
+            labels = []
+        repo_full_name = getattr(provider, "repo", "") or ""
+        if not isinstance(repo_full_name, str):
+            repo_full_name = ""
+        return should_process_pr_logic(
+            title=title or "",
+            sender=_pr_author(provider),
+            repo_full_name=repo_full_name,
+            labels=list(labels),
+            source_branch=source_branch or "",
+            target_branch=_target_branch(provider),
+        )
+    except Exception as e:
+        get_logger().warning(f"Could not evaluate config.ignore_pr_* for CLI; continuing: {e}")
+        return True
+
+
 def run(inargs=None, args=None):
     parser = set_parser()
     if not args:
@@ -215,6 +296,9 @@ def run(inargs=None, args=None):
         env_branch = (os.environ.get("PR_AGENT_CONFIG_BRANCH") or "").strip()
         get_settings().set("CONFIG.CONFIG_BRANCH", cli_branch or env_branch or None)
         get_settings().set("CONFIG.EXTRA_CONFIG_URL", getattr(args, "extra_config_url", None))
+        if args.pr_url and not diff_mode and not args.issue_url:
+            if not _cli_should_process_pr(args.pr_url):
+                return 0
         async def inner():
             # A CI artifact (see [artifacts]) reaches prompts from the environment or settings files,
             # the same way it does under the GitHub Action. Each asyncio.run gets a fresh task context.
