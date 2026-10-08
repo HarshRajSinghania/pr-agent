@@ -1,6 +1,7 @@
 import difflib
 import posixpath
 import re
+import time
 import urllib.parse
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -718,9 +719,13 @@ class GitLabProvider(GitProvider):
             self._default_branch = self.gl.projects.get(self.id_project).default_branch
         return self._default_branch
 
+    # A webhook for a newly opened MR can arrive before GitLab's API serves it.
+    # Retry only the initial lookup; later refreshes keep failing fast.
+    _MR_LOOKUP_404_BACKOFF_SECONDS = (1, 2, 4)
+
     def _set_merge_request(self, merge_request_url: str):
         self.id_project, self.id_mr = self._parse_merge_request_url(merge_request_url)
-        self.mr = self._get_merge_request()
+        self.mr = self._get_merge_request_retrying_not_found()
         try:
             # the versions endpoint is ordered newest-first, so the latest diff is the first entry
             self.last_diff = self.mr.diffs.list(page=1, per_page=1, get_all=False)[0]
@@ -2391,6 +2396,29 @@ class GitLabProvider(GitProvider):
     def _get_merge_request(self):
         mr = self.gl.projects.get(self.id_project).mergerequests.get(self.id_mr)
         return mr
+
+    def _get_merge_request_retrying_not_found(self):
+        """Look up the merge request, retrying a transient 404.
+
+        GitLab can answer 404 for a few seconds after an MR is created, which
+        drops the open webhook: the endpoint already returned 200, so GitLab
+        does not redeliver. Other errors, including a 404 on the last attempt,
+        are raised immediately.
+        """
+        attempts = len(self._MR_LOOKUP_404_BACKOFF_SECONDS) + 1
+        for attempt in range(attempts):
+            try:
+                return self._get_merge_request()
+            except GitlabGetError as error:
+                not_found = getattr(error, "response_code", None) == 404
+                if not not_found or attempt == attempts - 1:
+                    raise
+                delay = self._MR_LOOKUP_404_BACKOFF_SECONDS[attempt]
+                get_logger().warning(
+                    f"Merge request {self.id_mr} in {self.id_project} is not visible yet "
+                    f"(404); retrying in {delay}s ({attempt + 1}/{attempts - 1})"
+                )
+                time.sleep(delay)
 
     def get_user_id(self):
         return None
