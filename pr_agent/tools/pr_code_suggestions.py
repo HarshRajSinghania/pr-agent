@@ -2450,6 +2450,7 @@ class PRCodeSuggestions:
                          'num_code_suggestions': len(suggestion_list),
                          'prev_suggestions_str': prev_suggestions_str,
                          'extra_instructions': getattr(self, 'vars', {}).get('extra_instructions') or '',
+                         'artifact_context': (getattr(self, 'vars', {}) or {}).get('artifact_context') or None,
                          "is_ai_metadata": is_ai_metadata,
                          "diff_hunk_format": render_diff_hunk_format(
                              include_line_numbers=True,
