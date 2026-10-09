@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+from pr_agent.algo.artifacts import get_artifact_context
 from pr_agent.algo.comment_identity import (
     PRReviewHeader,
     PRReviewIdentity,
@@ -18,14 +19,16 @@ from pr_agent.algo.comment_identity import (
     render_hidden_marker,
 )
 from pr_agent.algo.inline_comment_dedup import (
+    KEY_ISSUE_LOCATION_MARKER_RE,
     InlineCommentStore,
     can_verify_inline_comment_publication,
     get_inline_comment_store,
     key_issue_body_with_markers,
     key_issue_fingerprint,
     key_issue_location_fingerprint,
+    strip_markers,
 )
-from pr_agent.algo.output_models import PRReview
+from pr_agent.algo.output_models import PRReview, parse_failure_modes
 from pr_agent.algo.pr_processing import (
     OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD,
     OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
@@ -65,6 +68,7 @@ from pr_agent.algo.utils import (
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import get_git_provider_with_context
 from pr_agent.git_providers.git_provider import (
+    DISCUSSION_CONTEXT_MAX_MESSAGE_CHARS,
     GitProvider,
     IncompleteProviderPullRequestFilesError,
     IncrementalPR,
@@ -72,6 +76,7 @@ from pr_agent.git_providers.git_provider import (
 )
 from pr_agent.log import get_logger
 from pr_agent.servers.help import HelpMessage
+from pr_agent.tools.pr_code_suggestions import _markdown_code_span
 from pr_agent.tools.progress_comment import ChunkProgressReporter
 from pr_agent.tools.ticket_pr_compliance_check import (
     extract_and_cache_pr_tickets,
@@ -174,6 +179,7 @@ class PRReviewer:
     prediction_data = None  # merged review dict; None means "parse self.prediction instead"
     review_chunk_count = 1
     review_failed_chunk_count = 0
+    partial_files_list = ()
 
     def __init__(self, pr_url: str, is_answer: bool = False, is_auto: bool = False, args: list = None,
                  ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
@@ -206,6 +212,7 @@ class PRReviewer:
         self.ai_handler.main_pr_language = self.main_language
         self.patches_diff = None
         self.remaining_files_list = []
+        self.partial_files_list = []
         self.prediction = None
         self._review_state_result = None
         self._review_state_blocked = False
@@ -238,6 +245,7 @@ class PRReviewer:
             "require_estimate_effort_to_review": get_settings().pr_reviewer.require_estimate_effort_to_review,
             "require_risk_assessment": get_settings().pr_reviewer.get("require_risk_assessment", False),
             "require_merge_recommendation": get_settings().pr_reviewer.get("require_merge_recommendation", False),
+            "require_failure_modes": get_settings().pr_reviewer.get("require_failure_modes", False),
             "require_priority_files": get_settings().pr_reviewer.get("require_priority_files", False),
             "require_estimate_contribution_time_cost": (
                 get_settings().pr_reviewer.require_estimate_contribution_time_cost
@@ -248,6 +256,7 @@ class PRReviewer:
             'question_str': question_str,
             'answer_str': answer_str,
             "extra_instructions": get_settings().pr_reviewer.extra_instructions,
+            "artifact_context": get_artifact_context("pr_reviewer"),
             "skills_context": get_skills_context(),
             "repo_context": build_repo_context(self.git_provider),
             "previous_findings": previous_findings,
@@ -283,8 +292,9 @@ class PRReviewer:
 
     async def run(self) -> None:
         init_run_details()
-        for name in ("_chunked_patches_diff_list", "_chunked_remaining_files_list", "_chunked_results",
-                     "_chunked_primary_model"):
+        self.partial_files_list = []
+        for name in ("_chunked_patches_diff_list", "_chunked_remaining_files_list", "_chunked_partial_files_list",
+                     "_chunked_results", "_chunked_primary_model"):
             self.__dict__.pop(name, None)
         progress_response = None
         partial_review_error = None
@@ -500,6 +510,7 @@ class PRReviewer:
                 review_failed
                 and not isinstance(review_error, IncompleteProviderPullRequestFilesError)
                 and get_settings().config.publish_output
+                and _as_bool(get_settings().pr_reviewer.get("publish_review_failure_comment", True))
                 and (
                     persistent_write_failed
                     or not get_settings().config.get("is_auto_command", False)
@@ -675,7 +686,30 @@ class PRReviewer:
         parsed = self._load_review_finding_state()
         if parsed is None or not parsed.valid:
             return ""
-        return render_previous_findings(parsed.state, max_chars)
+        return render_previous_findings(parsed.state, max_chars, self._load_dismissed_key_issues())
+
+    def _load_dismissed_key_issues(self) -> list[dict]:
+        """Return inline key issues whose threads indicate an eligible dismissal, newest first.
+
+        Only threads PR-Agent verifiably opened count. Providers determine eligible dismissal statuses;
+        Azure infers a decision from an explicit dismissal differing from its configured creation default.
+        """
+        dismissed = []
+        try:
+            for thread in self.git_provider._iter_review_threads():
+                if (thread.status != "resolved" or thread.authored_by_agent is not True
+                        or not KEY_ISSUE_LOCATION_MARKER_RE.search(thread.suggestion)):
+                    continue
+                finding = {"path": thread.file, "body": strip_markers(thread.suggestion).strip(),
+                           "line_start": thread.start_line, "line_end": thread.end_line}
+                replies = thread.text_replies()
+                if replies:
+                    finding["reply"] = replies[-1][1][:DISCUSSION_CONTEXT_MAX_MESSAGE_CHARS]
+                dismissed.append(finding)
+        except Exception as e:
+            get_logger().warning(f"Could not read resolved key-issue threads, error: {e}")
+            return []
+        return dismissed
 
     @staticmethod
     def _review_finding_from_issue(issue: dict) -> Optional[dict]:
@@ -789,13 +823,14 @@ class PRReviewer:
             self._review_state_block_reason = _STATE_BLOCK_REVIEW_DATA
             get_logger().warning("Review finding data is invalid; skipping persistent state update")
             return
+        incomplete_files = list(dict.fromkeys([*self.remaining_files_list, *self.partial_files_list]))
         if self._review_state_blocked:
             if self._review_state_block_reason == _STATE_BLOCK_INVALID_MARKER:
                 self._review_state_result = reconcile_review_findings(
                     None,
                     current_findings,
                     allow_resolution=False,
-                    excluded_files=self.remaining_files_list,
+                    excluded_files=incomplete_files,
                     head_sha=self._review_head_sha(),
                     run_id=self._review_run_id(),
                 )
@@ -815,7 +850,7 @@ class PRReviewer:
             # A merged result with failed chunks is still partial, even when chunking left
             # no additional token-budget files to report.
             and not bool(self.review_failed_chunk_count)
-            and not bool(self.remaining_files_list)
+            and not bool(incomplete_files)
             and parsed.valid
             and current_findings is not None
             # a dropped finding is not an absent one, so this run cannot resolve anything
@@ -826,7 +861,7 @@ class PRReviewer:
             parsed.state,
             current_findings,
             allow_resolution=allow_resolution,
-            excluded_files=self.remaining_files_list,
+            excluded_files=incomplete_files,
             head_sha=self._review_head_sha(),
             run_id=self._review_run_id(),
         )
@@ -846,6 +881,7 @@ class PRReviewer:
         self.prediction_data = None
         self.review_chunk_count = 1
         self.review_failed_chunk_count = 0
+        self.partial_files_list = []
         raw_prompt_vars = getattr(self, "_raw_prompt_vars", getattr(self, "vars", None))
         ai_handler = getattr(self, "ai_handler", None)
         output_token_reserve = getattr(
@@ -926,8 +962,10 @@ class PRReviewer:
         """
         comment = getattr(self, "_progress_response", None)
         settings = get_settings()
-        if comment is None or not settings.config.get("publish_output_progress", True):
+        if not settings.config.get("publish_output_progress", True):
             return None
+        # A missing comment falls through: create() then serves the check-run sink alone,
+        # which is the only progress channel automatic commands have.
         return ChunkProgressReporter.create(
             self.git_provider,
             comment,
@@ -954,7 +992,7 @@ class PRReviewer:
             multi_diff_kwargs = {
                 "max_calls": get_settings().pr_reviewer.get("max_number_of_calls", 3),
                 "add_line_numbers": True,
-                "return_remaining_files": True,
+                "return_coverage": True,
                 "include_filtered_file_names": False,
             }
             output_token_reserve = getattr(
@@ -964,13 +1002,15 @@ class PRReviewer:
                 multi_diff_kwargs["output_token_reserve"] = output_token_reserve
             if prepared_diff is not None:
                 multi_diff_kwargs["prepared_diff"] = prepared_diff
-            patches_diff_list, remaining_files_list = get_pr_multi_diffs(
+            coverage = get_pr_multi_diffs(
                 self.git_provider,
                 self.token_handler,
                 model,
                 **multi_diff_kwargs)
+            patches_diff_list = coverage.chunks
             self._chunked_patches_diff_list = patches_diff_list
-            self._chunked_remaining_files_list = remaining_files_list
+            self._chunked_remaining_files_list = coverage.remaining_files_list
+            self._chunked_partial_files_list = coverage.partial_files_list
             self._chunked_primary_model = model
         if len(patches_diff_list) < 2:
             get_logger().info("Large-diff chunking produced a single chunk, reviewing the PR in one call")
@@ -1125,6 +1165,7 @@ class PRReviewer:
         self.review_chunk_count = len(self._chunked_patches_diff_list)
         self.review_failed_chunk_count = self.review_chunk_count - len(chunk_results)
         self.remaining_files_list = self._chunked_remaining_files_list
+        self.partial_files_list = self._chunked_partial_files_list
         models = list(dict.fromkeys(chunk_results[index][2] for index in indices))
         details = get_run_details()
         if details is not None:
@@ -1188,20 +1229,21 @@ class PRReviewer:
                         first_key='review', last_key='security_concerns')
 
     def _validate_review_schema(self, data: object) -> bool:
+        is_valid = True
         try:
             PRReview.model_validate(data)
         except ValidationError as error:
-            first_error = error.errors()[0]
-            field_path = ".".join(str(part) for part in first_error.get("loc", ())) or "$"
-            value = None if first_error.get("type") == "missing" else first_error.get("input")
-            get_logger().warning(
-                "Review output failed schema validation",
-                artifact={
-                    "field": field_path,
-                    "value": value,
-                },
-            )
-            return False
+            is_valid = False
+            for err in error.errors():
+                field_path = ".".join(str(part) for part in err.get("loc", ())) or "$"
+                value = None if err.get("type") == "missing" else err.get("input")
+                get_logger().warning(
+                    "Review output failed schema validation",
+                    artifact={
+                        "field": field_path,
+                        "value": value,
+                    },
+                )
 
         if isinstance(data, dict) and isinstance(data.get("review"), dict):
             review = data["review"]
@@ -1210,6 +1252,7 @@ class PRReviewer:
                 ("estimated_effort_to_review_[1-5]", "require_estimate_effort_to_review"),
                 ("risk_level", "require_risk_assessment"),
                 ("merge_recommendation", "require_merge_recommendation"),
+                ("failure_modes", "require_failure_modes"),
                 ("review_priority_files", "require_priority_files"),
                 ("contribution_time_cost_estimate", "require_estimate_contribution_time_cost"),
                 ("score", "require_score"),
@@ -1223,12 +1266,12 @@ class PRReviewer:
             for field_name, setting_name in required_fields:
                 if not vars_.get(setting_name) or field_name in review and review[field_name] is not None:
                     continue
+                is_valid = False
                 get_logger().warning(
                     "Review output failed schema validation",
                     artifact={"field": f"review.{field_name}", "value": None},
                 )
-                return False
-        return True
+        return is_valid
 
     @classmethod
     def _load_valid_review_yaml(cls, prediction: str, *, source: str = "model response") -> dict:
@@ -1244,8 +1287,13 @@ class PRReviewer:
         the feedback.
         """
         data = self.prediction_data if self.prediction_data is not None else self._load_review_yaml(self.prediction)
+        if isinstance(data, dict) and isinstance(data.get("review"), dict):
+            if not getattr(self, "vars", {}).get("require_failure_modes", False):
+                data["review"].pop("failure_modes", None)
         if self.prediction_data is None:
             self._validate_review_schema(data)
+        if isinstance(data, dict) and isinstance(data.get("review"), dict) and "failure_modes" in data["review"]:
+            data["review"]["failure_modes"] = parse_failure_modes(data["review"]["failure_modes"])
         github_action_output(data, 'review')
 
         if not isinstance(data, dict) or not isinstance(data.get('review'), dict) or not data['review']:
@@ -1305,17 +1353,23 @@ class PRReviewer:
                 markdown_text += (f" {self.review_failed_chunk_count} chunk(s) failed and are not covered "
                                   "by this review.")
 
-        if self.remaining_files_list and get_settings().pr_reviewer.enable_review_coverage_footer:
-            displayed_files = self.remaining_files_list[:MAX_REVIEW_COVERAGE_FILES]
-            markdown_text += (
-                "\n\n<hr>\n\n"
-                "⚠️ **Review coverage:** The following files were not included in this review "
-                "because of the token budget:\n"
-                + "\n".join(f"- `{file}`" for file in displayed_files)
-            )
-            remaining_count = len(self.remaining_files_list) - len(displayed_files)
-            if remaining_count:
-                markdown_text += f"\n... and {remaining_count} more"
+        if get_settings().pr_reviewer.enable_review_coverage_footer:
+            for files, explanation in (
+                (self.remaining_files_list, "were not included in this review because of the token budget"),
+                (self.partial_files_list,
+                 "had patches clipped before analysis to fit the token budget (partial input coverage)"),
+            ):
+                if not files:
+                    continue
+                displayed_files = files[:MAX_REVIEW_COVERAGE_FILES]
+                markdown_text += (
+                    "\n\n<hr>\n\n"
+                    f"⚠️ **Review coverage:** The following files {explanation}:\n"
+                    + "\n".join(f"- {_markdown_code_span(file)}" for file in displayed_files)
+                )
+                remaining_count = len(files) - len(displayed_files)
+                if remaining_count:
+                    markdown_text += f"\n... and {remaining_count} more"
 
         # Add help text if gfm_markdown is supported
         if self.git_provider.is_supported("gfm_markdown") and get_settings().pr_reviewer.enable_help_text:
@@ -1363,7 +1417,7 @@ class PRReviewer:
                     else:
                         self._review_state_preserved = True
 
-        # Emit the review to optional external sinks (stdout/file/webhook/slack); no-op unless enabled.
+        # Emit the review to optional external sinks (stdout/file/webhook/slack/telegram); no-op unless enabled.
         # publish_output gates it so a dry run makes no external calls. The "no major issues"
         # suppression deliberately does not: that only silences the PR comment.
         if get_settings().config.publish_output:
