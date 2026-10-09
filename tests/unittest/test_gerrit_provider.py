@@ -854,10 +854,11 @@ def test_publish_code_suggestions_skips_a_symlink(tmp_path, monkeypatch):
     assert (tmp_path / ".git" / "config").exists()
 
 
-def test_publish_code_suggestions_skips_git_metadata(tmp_path, monkeypatch):
+@pytest.mark.parametrize("relevant_file", [".git/config", ".GIT/config"])
+def test_publish_code_suggestions_skips_git_metadata(tmp_path, monkeypatch, relevant_file):
     provider = _provider_for_suggestions(tmp_path)
     applied = []
     monkeypatch.setattr(gerrit_provider, "add_suggestion", lambda *args, **kwargs: applied.append(args))
 
-    assert provider.publish_code_suggestions([_suggestion(".git/config")]) is True
+    assert provider.publish_code_suggestions([_suggestion(relevant_file)]) is True
     assert applied == []

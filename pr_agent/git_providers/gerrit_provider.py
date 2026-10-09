@@ -476,7 +476,6 @@ class GerritProvider(GitProvider):
             try:
                 unresolved = repo_root / suggestion["relevant_file"]
                 target_path = unresolved.resolve()
-                target_path.relative_to(repo_root)
                 inside = [part.casefold() for part in target_path.relative_to(repo_root).parts]
                 if unresolved.is_symlink() or ".git" in inside:
                     raise ValueError("refuses to write through a symlink or into git metadata")
